@@ -298,6 +298,18 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             "Set to 1.0 to keep the previous behavior (no cap)."
         ),
     },
+    "async_prefetch_local_cpu_size": {
+        "type": float,
+        "default": 0.0,
+        "env_converter": float,
+        "description": (
+            "Optional dedicated CPU memory pool size in GB for async disk prefetch. "
+            "If > 0, disk prefetch will allocate from this separate pool instead of the "
+            "main LocalCPUBackend pool (max_local_cpu_size), preventing prefetch from "
+            "causing CPU pressure that blocks KV-cache store/offload buffering. "
+            "If 0, prefetch allocations share the main LocalCPUBackend pool."
+        ),
+    },
     "internal_api_server_enabled": {
         "type": bool,
         "default": False,

@@ -25,6 +25,7 @@ from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.memory_management import MixedMemoryAllocator
 
 if TYPE_CHECKING:
     # First Party
@@ -117,6 +118,26 @@ class LocalDiskBackend(StorageBackendInterface):
         self.dst_device = dst_device
 
         self.local_cpu_backend = local_cpu_backend
+
+        # Optional dedicated allocator for async prefetch.
+        # If enabled, prefetch buffers won't consume the main LocalCPUBackend pool that is
+        # also used as CPU staging buffer for KV-cache store/offload.
+        self.prefetch_cpu_backend: Optional[LocalCPUBackend] = None
+        prefetch_cpu_gb = getattr(config, "async_prefetch_local_cpu_size", 0.0) or 0.0
+        if prefetch_cpu_gb > 0:
+            prefetch_allocator = MixedMemoryAllocator(int(prefetch_cpu_gb * 1024**3))
+            # Create a lightweight LocalCPUBackend wrapper around the allocator.
+            # use_hot is controlled by config.local_cpu, but we only use allocate() here.
+            self.prefetch_cpu_backend = LocalCPUBackend(
+                config=config,
+                metadata=metadata,
+                dst_device=dst_device,
+                lmcache_worker=lmcache_worker,
+                memory_allocator=prefetch_allocator,
+            )
+            logger.info(
+                "Enabled dedicated async prefetch CPU pool: %.2f GB", prefetch_cpu_gb
+            )
 
         self.disk_lock = threading.Lock()
 
@@ -430,7 +451,12 @@ class LocalDiskBackend(StorageBackendInterface):
             assert dtype is not None
             assert shape is not None
 
-            memory_obj = self.local_cpu_backend.allocate(
+            alloc_backend = (
+                self.prefetch_cpu_backend
+                if self.prefetch_cpu_backend is not None
+                else self.local_cpu_backend
+            )
+            memory_obj = alloc_backend.allocate(
                 shape,
                 dtype,
                 fmt,
@@ -649,3 +675,6 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
+        if self.prefetch_cpu_backend is not None:
+            # Close dedicated prefetch allocator/pool.
+            self.prefetch_cpu_backend.close()
