@@ -109,6 +109,8 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             super().__init__("cpu")
 
+        self.config = config
+
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.dict = self.cache_policy.init_mutable_mapping()
 
@@ -393,7 +395,30 @@ class LocalDiskBackend(StorageBackendInterface):
         paths: list[str] = []
 
         logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
+
+        # Cap async prefetch so it does not consume the entire LocalCPUBackend pool.
+        # This pool is also used as the CPU staging buffer for normal KV-cache store/offload.
+        prefetch_max_ratio = getattr(self.config, "async_prefetch_max_ratio", 1.0)
+        # Be robust to invalid values.
+        if prefetch_max_ratio is None:
+            prefetch_max_ratio = 1.0
+        prefetch_max_ratio = max(0.0, min(1.0, float(prefetch_max_ratio)))
+        cpu_pool_bytes = int(self.config.max_local_cpu_size * 1024**3)
+        prefetch_budget_bytes = int(cpu_pool_bytes * prefetch_max_ratio)
+        prefetch_bytes_used = 0
+
         for key in keys:
+            # If budget is 0, skip prefetch entirely.
+            if prefetch_bytes_used >= prefetch_budget_bytes:
+                logger.info(
+                    "Async prefetch budget reached (used=%s bytes, budget=%s bytes). "
+                    "Stop prefetching remaining %s chunks.",
+                    prefetch_bytes_used,
+                    prefetch_budget_bytes,
+                    len(keys) - len(mem_objs),
+                )
+                break
+
             self.disk_lock.acquire()
             assert key in self.dict, f"Key {key} not found in disk cache after pinning"
 
@@ -411,9 +436,33 @@ class LocalDiskBackend(StorageBackendInterface):
                 fmt,
             )
 
-            assert memory_obj is not None, (
-                "Memory allocation failed during async disk load."
-            )
+            # Best-effort prefetch: if allocation fails, stop prefetching further.
+            if memory_obj is None:
+                self.disk_lock.release()
+                logger.warning(
+                    "Async disk prefetch allocation failed (likely CPU memory pressure). "
+                    "Stop prefetching remaining chunks for lookup_id=%s.",
+                    lookup_id,
+                )
+                break
+
+            # If the allocated object would exceed the budget, free it and stop.
+            mem_phy = memory_obj.get_physical_size()
+            if prefetch_bytes_used + mem_phy > prefetch_budget_bytes:
+                # Free the just-allocated object.
+                memory_obj.ref_count_down()
+                self.disk_lock.release()
+                logger.info(
+                    "Async prefetch budget reached (used=%s bytes, next=%s bytes, budget=%s bytes). "
+                    "Stop prefetching remaining chunks for lookup_id=%s.",
+                    prefetch_bytes_used,
+                    mem_phy,
+                    prefetch_budget_bytes,
+                    lookup_id,
+                )
+                break
+
+            prefetch_bytes_used += mem_phy
 
             self.dict[key].pin()
 
@@ -427,11 +476,14 @@ class LocalDiskBackend(StorageBackendInterface):
             mem_objs.append(memory_obj)
             paths.append(path)
 
+        # Only submit tasks for keys that were actually prefetched.
+        prefetched_keys = keys[: len(mem_objs)]
+
         return await self.disk_worker.submit_task(
             "prefetch",
             self.batched_async_load_bytes_from_disk,
             paths=paths,
-            keys=keys,
+            keys=prefetched_keys,
             memory_objs=mem_objs,
         )
 

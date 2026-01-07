@@ -287,6 +287,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "async_prefetch_max_ratio": {
+        "type": float,
+        "default": 0.5,
+        "env_converter": float,
+        "description": (
+            "Maximum fraction (0.0-1.0) of max_local_cpu_size that async disk prefetch "
+            "is allowed to allocate. This prevents async prefetch from consuming the "
+            "entire local CPU buffer and blocking normal KV-cache store/offload. "
+            "Set to 1.0 to keep the previous behavior (no cap)."
+        ),
+    },
     "internal_api_server_enabled": {
         "type": bool,
         "default": False,
