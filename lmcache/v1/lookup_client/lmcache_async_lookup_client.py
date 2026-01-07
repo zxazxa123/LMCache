@@ -362,7 +362,7 @@ class LMCacheAsyncLookupServer:
                         lookup_id=msg.lookup_id,
                         hashes=msg.hashes,
                         offsets=msg.offsets,
-                        pin=True,
+                        pin=False,
                         request_configs=msg.request_configs,
                     )
 
