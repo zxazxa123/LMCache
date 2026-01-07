@@ -1276,10 +1276,22 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, lookup_id: str) -> None:
-        if lookup_id in self.lookup_pins:
-            assert self.storage_manager is not None
-            for location, keys in self.lookup_pins.pop(lookup_id).items():
+        """Unpin any keys pinned for this lookup_id.
+
+        Pins can come from:
+        - sync lookup() path (tracked in self.lookup_pins)
+        - async-loading path (tracked in StorageManager.async_lookup_and_prefetch)
+        """
+        assert self.storage_manager is not None
+
+        pins = self.lookup_pins.pop(lookup_id, None)
+        if pins:
+            for location, keys in pins.items():
                 self.storage_manager.batched_unpin(keys, [location])
+
+        # Also unpin keys pinned during async lookup/prefetch.
+        if hasattr(self.storage_manager, "async_lookup_unpin"):
+            self.storage_manager.async_lookup_unpin(lookup_id)
 
     @_lmcache_nvtx_annotate
     def clear(

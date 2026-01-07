@@ -275,6 +275,13 @@ class StorageManager:
         self._freeze = False
         self._freeze_lock = threading.RLock()
 
+        # lookup_id -> {backend_name -> [pinned keys]}
+        # Used for async-loading path: pin happens during batched_async_contains,
+        # and must be explicitly unpinned later (e.g., by vLLM calling
+        # LMCacheEngine.lookup_unpin(req_id)).
+        self._async_lookup_pins: dict[str, dict[str, list[CacheEngineKey]]] = {}
+        self._async_lookup_pins_lock = threading.Lock()
+
         if not self.enable_pd and self.config.enable_async_loading:
             assert self.allocator_backend is not None
             self.async_serializer = AsyncSingleSerializer(self.loop)
@@ -688,6 +695,16 @@ class StorageManager:
             backend_keys = keys[:num_hit_chunks]
             loading_task_keys.append(backend_keys)
 
+            # Track pins for async-loading so they can be unpinned later.
+            # Without this, pinned objects accumulate and become non-evictable,
+            # leading to persistent CPU allocator exhaustion.
+            if pin and num_hit_chunks > 0:
+                with self._async_lookup_pins_lock:
+                    if lookup_id not in self._async_lookup_pins:
+                        self._async_lookup_pins[lookup_id] = {}
+                    self._async_lookup_pins[lookup_id].setdefault(backend_name, [])
+                    self._async_lookup_pins[lookup_id][backend_name].extend(backend_keys)
+
             assert self.async_serializer is not None, (
                 "Async serializer must be initialized via post_init before using "
                 "async_lookup_and_prefetch."
@@ -959,6 +976,28 @@ class StorageManager:
             if locations is None or backend_name in locations:
                 for key in keys:
                     backend.unpin(key)
+
+    def async_lookup_unpin(self, lookup_id: str) -> None:
+        """Unpin keys pinned during async_lookup_and_prefetch.
+
+        In async-loading mode, pins happen inside StorageManager.async_lookup_and_prefetch
+        (via backend.batched_async_contains(..., pin=True)). Those pins are not tracked
+        by LMCacheEngine.lookup(), so we must track and unpin them separately.
+
+        This method is safe to call multiple times.
+        """
+        with self._async_lookup_pins_lock:
+            pins = self._async_lookup_pins.pop(lookup_id, None)
+
+        if not pins:
+            return
+
+        for backend_name, keys in pins.items():
+            backend = self.storage_backends.get(backend_name)
+            if backend is None:
+                continue
+            for key in keys:
+                backend.unpin(key)
 
     def clear(
         self,
