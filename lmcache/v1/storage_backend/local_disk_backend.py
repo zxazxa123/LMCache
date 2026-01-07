@@ -55,13 +55,18 @@ class LocalDiskWorker:
         *args,
         **kwargs,
     ) -> Any:
-        if task_type == "prefetch":
+        # NOTE: smaller number => higher priority in AsyncPQ* executors.
+        # Under high concurrency, we must prioritize "put" (store/writeback)
+        # over "prefetch" to avoid starving writes: starving writes keeps many
+        # CPU buffers alive (refcount_up in submit_put_task), which can trigger
+        # "Local cpu memory is under pressure" and cause stores to be skipped.
+        if task_type == "put":
             priority = 0
-            # self.insert_prefetch_task(kwargs["key"], None)
         elif task_type == "delete":
             priority = 1
-        elif task_type == "put":
+        elif task_type == "prefetch":
             priority = 2
+            # self.insert_prefetch_task(kwargs["key"], None)
         else:
             raise ValueError(f"Unknown task type: {task_type}")
 
@@ -71,6 +76,20 @@ class LocalDiskWorker:
             priority=priority,
             **kwargs,
         )
+
+    def get_inflight_prefetch_count(self) -> int:
+        # Best-effort (executor queue is not exposed). Track only tasks currently
+        # known to be in-flight via this map.
+        with self.prefetch_lock:
+            return len(self.prefetch_tasks)
+
+    def insert_prefetch_task(self, key: CacheEngineKey, fut: Future) -> None:
+        with self.prefetch_lock:
+            self.prefetch_tasks[key] = fut
+
+    def remove_prefetch_task(self, key: CacheEngineKey) -> None:
+        with self.prefetch_lock:
+            self.prefetch_tasks.pop(key, None)
 
     def remove_put_task(self, key: CacheEngineKey):
         with self.put_lock:
@@ -417,6 +436,21 @@ class LocalDiskBackend(StorageBackendInterface):
 
         logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
 
+        # Limit number of in-flight prefetch tasks to avoid saturating disk workers and
+        # accumulating too many outstanding CPU buffers under high concurrency.
+        max_inflight = getattr(self.config, "async_prefetch_max_inflight", 0)
+        try:
+            max_inflight = int(max_inflight)
+        except Exception:
+            max_inflight = 0
+        if max_inflight > 0 and self.disk_worker.get_inflight_prefetch_count() >= max_inflight:
+            logger.info(
+                "Skipping async prefetch for lookup_id=%s because in-flight prefetch tasks reached limit (%s).",
+                lookup_id,
+                max_inflight,
+            )
+            return []
+
         # Cap async prefetch so it does not consume the entire LocalCPUBackend pool.
         # This pool is also used as the CPU staging buffer for normal KV-cache store/offload.
         prefetch_max_ratio = getattr(self.config, "async_prefetch_max_ratio", 1.0)
@@ -505,13 +539,26 @@ class LocalDiskBackend(StorageBackendInterface):
         # Only submit tasks for keys that were actually prefetched.
         prefetched_keys = keys[: len(mem_objs)]
 
-        return await self.disk_worker.submit_task(
-            "prefetch",
-            self.batched_async_load_bytes_from_disk,
-            paths=paths,
-            keys=prefetched_keys,
-            memory_objs=mem_objs,
+        # Track this prefetch as in-flight using the first key as representative.
+        # We record the future so we can enforce async_prefetch_max_inflight.
+        # (If there are 0 prefetched keys, it will simply return quickly.)
+        fut = asyncio.create_task(
+            self.disk_worker.submit_task(
+                "prefetch",
+                self.batched_async_load_bytes_from_disk,
+                paths=paths,
+                keys=prefetched_keys,
+                memory_objs=mem_objs,
+            )
         )
+        if prefetched_keys:
+            self.disk_worker.insert_prefetch_task(prefetched_keys[0], fut)
+
+        try:
+            return await fut
+        finally:
+            if prefetched_keys:
+                self.disk_worker.remove_prefetch_task(prefetched_keys[0])
 
     async def batched_async_contains(
         self,

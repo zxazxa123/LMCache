@@ -310,6 +310,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             "If 0, prefetch allocations share the main LocalCPUBackend pool."
         ),
     },
+    "async_prefetch_max_inflight": {
+        "type": int,
+        "default": 8,
+        "env_converter": int,
+        "description": (
+            "Maximum number of in-flight async disk prefetch tasks per cache engine. "
+            "If exceeded, new prefetch requests will be skipped (best-effort) to avoid "
+            "disk executor saturation and CPU memory pressure under high concurrency."
+        ),
+    },
     "internal_api_server_enabled": {
         "type": bool,
         "default": False,
