@@ -603,6 +603,7 @@ class StorageManager:
         self,
         task: asyncio.Future,
         lookup_id: str,
+        loading_future: asyncio.Future,
         cum_chunk_lengths_total: list[int],
         tier_expected_chunks: list[int],
     ) -> None:
@@ -611,10 +612,13 @@ class StorageManager:
         (i.e., prefetching from all backends for the entire request) are done.
         """
         assert self.async_lookup_server is not None
+        res = task.result()
+        # Complete the pre-registered LOADING future and mark the event DONE.
+        if not loading_future.done():
+            loading_future.set_result(res)
         self.event_manager.update_event_status(
             EventType.LOADING, lookup_id, status=EventStatus.DONE
         )
-        res = task.result()
 
         # Calculate total retrieved chunks across all tiers based on actual results
         # from batched_get_non_blocking, not the batched_async_contains results.
@@ -724,6 +728,13 @@ class StorageManager:
         num_total_chunks = len(keys)
         num_total_hit_chunks = 0
 
+        # Register LOADING event immediately to avoid race conditions where
+        # CacheEngine/vLLM tries to pop the event before we reach the end of the
+        # function.
+        loop = asyncio.get_running_loop()
+        loading_future: asyncio.Future = loop.create_future()
+        self.event_manager.add_event(EventType.LOADING, lookup_id, loading_future)
+
         # Gate: If CPU DRAM pinned memory is too full, do NOT prefetch.
         # We still compute and return the true number of hit tokens (prefix hit),
         # but behave like normal lookup (no allocation/loading, no pinning).
@@ -803,6 +814,12 @@ class StorageManager:
 
         # If no chunks were hit across all backends, respond immediately and return.
         if num_total_hit_chunks == 0:
+            # Mark LOADING event done with empty result so CacheEngine can pop.
+            if not loading_future.done():
+                loading_future.set_result([])
+            self.event_manager.update_event_status(
+                EventType.LOADING, lookup_id, status=EventStatus.DONE
+            )
             if self.async_lookup_server is not None:
                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
             return
@@ -810,22 +827,12 @@ class StorageManager:
         # If we decided to skip prefetching, immediately return the true hit-token
         # count (prefix hit) without allocating/loading anything.
         if not do_prefetch:
-            # Even when we skip prefetching, CacheEngine/vLLM expects a LOADING
-            # event to exist and be DONE so it can be popped during the normal
-            # async-loading lifecycle.
-            try:
-                loop = asyncio.get_running_loop()
-                fut: asyncio.Future = loop.create_future()
-                # Match the normal async-loading future result shape:
-                # a list of per-backend lists of MemoryObj.
-                fut.set_result([])
-                self.event_manager.add_event(EventType.LOADING, lookup_id, fut)
-                self.event_manager.update_event_status(
-                    EventType.LOADING, lookup_id, status=EventStatus.DONE
-                )
-            except Exception:
-                # Best effort: don't fail lookup because of event bookkeeping.
-                pass
+            # Mark LOADING event done with empty result so CacheEngine can pop.
+            if not loading_future.done():
+                loading_future.set_result([])
+            self.event_manager.update_event_status(
+                EventType.LOADING, lookup_id, status=EventStatus.DONE
+            )
 
             retrieved_length = cum_chunk_lengths_total[num_total_hit_chunks]
             logger.info(
@@ -859,17 +866,11 @@ class StorageManager:
             ]
 
         all_done = asyncio.create_task(gather_with_keys())
-        # Register the event before adding the callback to avoid race conditions
-        self.event_manager.add_event(
-            EventType.LOADING,
-            lookup_id,
-            all_done,
-        )
-
         all_done.add_done_callback(
             lambda future: self.prefetch_all_done_callback(
                 future,
                 lookup_id,
+                loading_future,
                 cum_chunk_lengths_total,
                 tier_expected_chunks,
             )
