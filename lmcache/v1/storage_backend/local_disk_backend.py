@@ -25,7 +25,6 @@ from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.memory_management import MixedMemoryAllocator
 
 if TYPE_CHECKING:
     # First Party
@@ -55,18 +54,13 @@ class LocalDiskWorker:
         *args,
         **kwargs,
     ) -> Any:
-        # NOTE: smaller number => higher priority in AsyncPQ* executors.
-        # Under high concurrency, we must prioritize "put" (store/writeback)
-        # over "prefetch" to avoid starving writes: starving writes keeps many
-        # CPU buffers alive (refcount_up in submit_put_task), which can trigger
-        # "Local cpu memory is under pressure" and cause stores to be skipped.
-        if task_type == "put":
+        if task_type == "prefetch":
             priority = 0
+            # self.insert_prefetch_task(kwargs["key"], None)
         elif task_type == "delete":
             priority = 1
-        elif task_type == "prefetch":
+        elif task_type == "put":
             priority = 2
-            # self.insert_prefetch_task(kwargs["key"], None)
         else:
             raise ValueError(f"Unknown task type: {task_type}")
 
@@ -76,20 +70,6 @@ class LocalDiskWorker:
             priority=priority,
             **kwargs,
         )
-
-    def get_inflight_prefetch_count(self) -> int:
-        # Best-effort (executor queue is not exposed). Track only tasks currently
-        # known to be in-flight via this map.
-        with self.prefetch_lock:
-            return len(self.prefetch_tasks)
-
-    def insert_prefetch_task(self, key: CacheEngineKey, fut: Future) -> None:
-        with self.prefetch_lock:
-            self.prefetch_tasks[key] = fut
-
-    def remove_prefetch_task(self, key: CacheEngineKey) -> None:
-        with self.prefetch_lock:
-            self.prefetch_tasks.pop(key, None)
 
     def remove_put_task(self, key: CacheEngineKey):
         with self.put_lock:
@@ -129,34 +109,12 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             super().__init__("cpu")
 
-        self.config = config
-
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.dict = self.cache_policy.init_mutable_mapping()
 
         self.dst_device = dst_device
 
         self.local_cpu_backend = local_cpu_backend
-
-        # Optional dedicated allocator for async prefetch.
-        # If enabled, prefetch buffers won't consume the main LocalCPUBackend pool that is
-        # also used as CPU staging buffer for KV-cache store/offload.
-        self.prefetch_cpu_backend: Optional[LocalCPUBackend] = None
-        prefetch_cpu_gb = getattr(config, "async_prefetch_local_cpu_size", 0.0) or 0.0
-        if prefetch_cpu_gb > 0:
-            prefetch_allocator = MixedMemoryAllocator(int(prefetch_cpu_gb * 1024**3))
-            # Create a lightweight LocalCPUBackend wrapper around the allocator.
-            # use_hot is controlled by config.local_cpu, but we only use allocate() here.
-            self.prefetch_cpu_backend = LocalCPUBackend(
-                config=config,
-                metadata=metadata,
-                dst_device=dst_device,
-                lmcache_worker=lmcache_worker,
-                memory_allocator=prefetch_allocator,
-            )
-            logger.info(
-                "Enabled dedicated async prefetch CPU pool: %.2f GB", prefetch_cpu_gb
-            )
 
         self.disk_lock = threading.Lock()
 
@@ -435,45 +393,7 @@ class LocalDiskBackend(StorageBackendInterface):
         paths: list[str] = []
 
         logger.debug(f"lookup_id: {lookup_id}; Prefetching {len(keys)} keys from disk.")
-
-        # Limit number of in-flight prefetch tasks to avoid saturating disk workers and
-        # accumulating too many outstanding CPU buffers under high concurrency.
-        max_inflight = getattr(self.config, "async_prefetch_max_inflight", 0)
-        try:
-            max_inflight = int(max_inflight)
-        except Exception:
-            max_inflight = 0
-        if max_inflight > 0 and self.disk_worker.get_inflight_prefetch_count() >= max_inflight:
-            logger.info(
-                "Skipping async prefetch for lookup_id=%s because in-flight prefetch tasks reached limit (%s).",
-                lookup_id,
-                max_inflight,
-            )
-            return []
-
-        # Cap async prefetch so it does not consume the entire LocalCPUBackend pool.
-        # This pool is also used as the CPU staging buffer for normal KV-cache store/offload.
-        prefetch_max_ratio = getattr(self.config, "async_prefetch_max_ratio", 1.0)
-        # Be robust to invalid values.
-        if prefetch_max_ratio is None:
-            prefetch_max_ratio = 1.0
-        prefetch_max_ratio = max(0.0, min(1.0, float(prefetch_max_ratio)))
-        cpu_pool_bytes = int(self.config.max_local_cpu_size * 1024**3)
-        prefetch_budget_bytes = int(cpu_pool_bytes * prefetch_max_ratio)
-        prefetch_bytes_used = 0
-
         for key in keys:
-            # If budget is 0, skip prefetch entirely.
-            if prefetch_bytes_used >= prefetch_budget_bytes:
-                logger.info(
-                    "Async prefetch budget reached (used=%s bytes, budget=%s bytes). "
-                    "Stop prefetching remaining %s chunks.",
-                    prefetch_bytes_used,
-                    prefetch_budget_bytes,
-                    len(keys) - len(mem_objs),
-                )
-                break
-
             self.disk_lock.acquire()
             assert key in self.dict, f"Key {key} not found in disk cache after pinning"
 
@@ -485,44 +405,15 @@ class LocalDiskBackend(StorageBackendInterface):
             assert dtype is not None
             assert shape is not None
 
-            alloc_backend = (
-                self.prefetch_cpu_backend
-                if self.prefetch_cpu_backend is not None
-                else self.local_cpu_backend
-            )
-            memory_obj = alloc_backend.allocate(
+            memory_obj = self.local_cpu_backend.allocate(
                 shape,
                 dtype,
                 fmt,
             )
 
-            # Best-effort prefetch: if allocation fails, stop prefetching further.
-            if memory_obj is None:
-                self.disk_lock.release()
-                logger.warning(
-                    "Async disk prefetch allocation failed (likely CPU memory pressure). "
-                    "Stop prefetching remaining chunks for lookup_id=%s.",
-                    lookup_id,
-                )
-                break
-
-            # If the allocated object would exceed the budget, free it and stop.
-            mem_phy = memory_obj.get_physical_size()
-            if prefetch_bytes_used + mem_phy > prefetch_budget_bytes:
-                # Free the just-allocated object.
-                memory_obj.ref_count_down()
-                self.disk_lock.release()
-                logger.info(
-                    "Async prefetch budget reached (used=%s bytes, next=%s bytes, budget=%s bytes). "
-                    "Stop prefetching remaining chunks for lookup_id=%s.",
-                    prefetch_bytes_used,
-                    mem_phy,
-                    prefetch_budget_bytes,
-                    lookup_id,
-                )
-                break
-
-            prefetch_bytes_used += mem_phy
+            assert memory_obj is not None, (
+                "Memory allocation failed during async disk load."
+            )
 
             self.dict[key].pin()
 
@@ -536,29 +427,13 @@ class LocalDiskBackend(StorageBackendInterface):
             mem_objs.append(memory_obj)
             paths.append(path)
 
-        # Only submit tasks for keys that were actually prefetched.
-        prefetched_keys = keys[: len(mem_objs)]
-
-        # Track this prefetch as in-flight using the first key as representative.
-        # We record the future so we can enforce async_prefetch_max_inflight.
-        # (If there are 0 prefetched keys, it will simply return quickly.)
-        fut = asyncio.create_task(
-            self.disk_worker.submit_task(
-                "prefetch",
-                self.batched_async_load_bytes_from_disk,
-                paths=paths,
-                keys=prefetched_keys,
-                memory_objs=mem_objs,
-            )
+        return await self.disk_worker.submit_task(
+            "prefetch",
+            self.batched_async_load_bytes_from_disk,
+            paths=paths,
+            keys=keys,
+            memory_objs=mem_objs,
         )
-        if prefetched_keys:
-            self.disk_worker.insert_prefetch_task(prefetched_keys[0], fut)
-
-        try:
-            return await fut
-        finally:
-            if prefetched_keys:
-                self.disk_worker.remove_prefetch_task(prefetched_keys[0])
 
     async def batched_async_contains(
         self,
@@ -722,6 +597,3 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
-        if self.prefetch_cpu_backend is not None:
-            # Close dedicated prefetch allocator/pool.
-            self.prefetch_cpu_backend.close()

@@ -43,7 +43,6 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
@@ -207,6 +206,68 @@ class StorageManager:
     The StorageManager is responsible for managing the storage backends.
     """
 
+    def _get_cpu_allocator_utilization_ratio(self) -> Optional[float]:
+        """Return CPU pinned-memory utilization ratio (used/capacity) if available.
+
+        This is best-effort and only used to decide whether to *prefetch* during
+        async loading. When utilization can't be determined, returns None.
+        """
+
+        try:
+            if self.allocator_backend is None:
+                return None
+            mem_alloc = self.allocator_backend.get_memory_allocator()
+
+            # Prefer duck-typing: any allocator that exposes a `pin_allocator`
+            # with `total_allocated_size` and a `buffer`/`buffer_size` can be used.
+            pin_alloc = getattr(mem_alloc, "pin_allocator", None)
+            if pin_alloc is None:
+                return None
+
+            used = getattr(pin_alloc, "total_allocated_size", None)
+            if used is None:
+                return None
+
+            # Capacity is represented as either `buffer.numel()` (bytes) or
+            # `buffer_size` (bytes).
+            capacity = None
+            buf = getattr(pin_alloc, "buffer", None)
+            if buf is not None:
+                capacity = int(buf.numel())
+            if capacity is None:
+                capacity = getattr(pin_alloc, "buffer_size", None)
+            if capacity is None:
+                return None
+
+            capacity = int(capacity)
+            if capacity <= 0:
+                return None
+
+            return float(used) / float(capacity)
+        except Exception:
+            # Never let telemetry break the storage path.
+            return None
+
+    def _should_prefetch_for_async_loading(self) -> bool:
+        """Whether async lookup should actually prefetch/load into CPU DRAM."""
+
+        # If async loading isn't enabled, we shouldn't be here, but keep logic safe.
+        if not self.config.enable_async_loading:
+            return False
+
+        threshold = self.config.async_loading_prefetch_max_cpu_utilization
+        # If configured to >=1.0, treat as always enabled.
+        if threshold is None or threshold >= 1.0:
+            return True
+
+        util = self._get_cpu_allocator_utilization_ratio()
+        if util is None:
+            # Conservative default: allow prefetch if we cannot determine usage.
+            return True
+
+        return util < float(threshold)
+
+
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -274,13 +335,6 @@ class StorageManager:
         # freeze mode: only use local_cpu backend for retrieval
         self._freeze = False
         self._freeze_lock = threading.RLock()
-
-        # lookup_id -> {backend_name -> [pinned keys]}
-        # Used for async-loading path: pin happens during batched_async_contains,
-        # and must be explicitly unpinned later (e.g., by vLLM calling
-        # LMCacheEngine.lookup_unpin(req_id)).
-        self._async_lookup_pins: dict[str, dict[str, list[CacheEngineKey]]] = {}
-        self._async_lookup_pins_lock = threading.Lock()
 
         if not self.enable_pd and self.config.enable_async_loading:
             assert self.allocator_backend is not None
@@ -669,6 +723,11 @@ class StorageManager:
 
         num_total_chunks = len(keys)
         num_total_hit_chunks = 0
+
+        # Gate: If CPU DRAM pinned memory is too full, do NOT prefetch.
+        # We still compute and return the true number of hit tokens (prefix hit),
+        # but behave like normal lookup (no allocation/loading, no pinning).
+        do_prefetch = self._should_prefetch_for_async_loading()
         # cum_chunk_lengths_total: A copy of the original cumulative chunk lengths
         # for all chunks. This is preserved to calculate the final token count
         # based on the actual retrieved chunks.
@@ -684,7 +743,14 @@ class StorageManager:
         for backend_name, backend in self.get_active_storage_backends(
             search_range=search_range
         ):
-            num_hit_chunks = await backend.batched_async_contains(lookup_id, keys, pin)
+            # IMPORTANT: when do_prefetch=False, we must avoid pinning.
+            # Pinning during async lookup can cause CPU DRAM to be pinned and
+            # become unevictable, which is exactly what we want to avoid under
+            # memory pressure.
+            contains_pin = pin if do_prefetch else False
+            num_hit_chunks = await backend.batched_async_contains(
+                lookup_id, keys, contains_pin
+            )
 
             if num_hit_chunks == 0:
                 continue
@@ -692,18 +758,18 @@ class StorageManager:
             num_total_hit_chunks += num_hit_chunks
             tier_expected_chunks.append(num_hit_chunks)
 
+            # If we are skipping prefetch, we only need the hit count.
+            if not do_prefetch:
+                # Prefix semantics: stop at first tier where hit_chunks < remaining
+                # or once we fully cover all chunks.
+                cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
+                if num_total_hit_chunks == num_total_chunks:
+                    break
+                keys = keys[num_hit_chunks:]
+                continue
+
             backend_keys = keys[:num_hit_chunks]
             loading_task_keys.append(backend_keys)
-
-            # Track pins for async-loading so they can be unpinned later.
-            # Without this, pinned objects accumulate and become non-evictable,
-            # leading to persistent CPU allocator exhaustion.
-            if pin and num_hit_chunks > 0:
-                with self._async_lookup_pins_lock:
-                    if lookup_id not in self._async_lookup_pins:
-                        self._async_lookup_pins[lookup_id] = {}
-                    self._async_lookup_pins[lookup_id].setdefault(backend_name, [])
-                    self._async_lookup_pins[lookup_id][backend_name].extend(backend_keys)
 
             assert self.async_serializer is not None, (
                 "Async serializer must be initialized via post_init before using "
@@ -739,6 +805,22 @@ class StorageManager:
         if num_total_hit_chunks == 0:
             if self.async_lookup_server is not None:
                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            return
+
+        # If we decided to skip prefetching, immediately return the true hit-token
+        # count (prefix hit) without allocating/loading anything.
+        if not do_prefetch:
+            retrieved_length = cum_chunk_lengths_total[num_total_hit_chunks]
+            logger.info(
+                "Skip prefetch for lookup_id=%s due to CPU DRAM pressure; "
+                "reporting hit tokens=%s",
+                lookup_id,
+                retrieved_length,
+            )
+            if self.async_lookup_server is not None:
+                self.async_lookup_server.send_response_to_scheduler(
+                    lookup_id, retrieved_length
+                )
             return
 
         # gather_with_keys() here make a pair of (key, memory_obj) for each chunk
@@ -976,28 +1058,6 @@ class StorageManager:
             if locations is None or backend_name in locations:
                 for key in keys:
                     backend.unpin(key)
-
-    def async_lookup_unpin(self, lookup_id: str) -> None:
-        """Unpin keys pinned during async_lookup_and_prefetch.
-
-        In async-loading mode, pins happen inside StorageManager.async_lookup_and_prefetch
-        (via backend.batched_async_contains(..., pin=True)). Those pins are not tracked
-        by LMCacheEngine.lookup(), so we must track and unpin them separately.
-
-        This method is safe to call multiple times.
-        """
-        with self._async_lookup_pins_lock:
-            pins = self._async_lookup_pins.pop(lookup_id, None)
-
-        if not pins:
-            return
-
-        for backend_name, keys in pins.items():
-            backend = self.storage_backends.get(backend_name)
-            if backend is None:
-                continue
-            for key in keys:
-                backend.unpin(key)
 
     def clear(
         self,

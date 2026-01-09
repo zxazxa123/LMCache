@@ -287,38 +287,14 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    "async_prefetch_max_ratio": {
+    # For async loading, we may still want to skip *prefetching* (allocating CPU
+    # pinned memory and loading from disk) when CPU DRAM is too full. In that
+    # case, async lookup should still return the true hit tokens, but behave
+    # like normal lookup (no prefetch / no pinning).
+    "async_loading_prefetch_max_cpu_utilization": {
         "type": float,
-        "default": 0.5,
+        "default": 0.95,
         "env_converter": float,
-        "description": (
-            "Maximum fraction (0.0-1.0) of max_local_cpu_size that async disk prefetch "
-            "is allowed to allocate. This prevents async prefetch from consuming the "
-            "entire local CPU buffer and blocking normal KV-cache store/offload. "
-            "Set to 1.0 to keep the previous behavior (no cap)."
-        ),
-    },
-    "async_prefetch_local_cpu_size": {
-        "type": float,
-        "default": 0.0,
-        "env_converter": float,
-        "description": (
-            "Optional dedicated CPU memory pool size in GB for async disk prefetch. "
-            "If > 0, disk prefetch will allocate from this separate pool instead of the "
-            "main LocalCPUBackend pool (max_local_cpu_size), preventing prefetch from "
-            "causing CPU pressure that blocks KV-cache store/offload buffering. "
-            "If 0, prefetch allocations share the main LocalCPUBackend pool."
-        ),
-    },
-    "async_prefetch_max_inflight": {
-        "type": int,
-        "default": 8,
-        "env_converter": int,
-        "description": (
-            "Maximum number of in-flight async disk prefetch tasks per cache engine. "
-            "If exceeded, new prefetch requests will be skipped (best-effort) to avoid "
-            "disk executor saturation and CPU memory pressure under high concurrency."
-        ),
     },
     "internal_api_server_enabled": {
         "type": bool,
