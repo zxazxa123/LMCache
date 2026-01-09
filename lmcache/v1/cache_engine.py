@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import Future as ConcurrentFuture
 from typing import (
     Any,
     Callable,
@@ -1109,6 +1110,12 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             keys.append(key)
             cum_chunk_lengths.append(end)
+
+        # Register LOADING event *synchronously* before dispatching the coroutine.
+        # This avoids a race where the scheduler pops the event before the async
+        # coroutine gets CPU time.
+        if self.event_manager.get_event_status(EventType.LOADING, lookup_id) == EventStatus.NOT_FOUND:
+            self.event_manager.add_event(EventType.LOADING, lookup_id, ConcurrentFuture())
 
         asyncio.run_coroutine_threadsafe(
             self.storage_manager.async_lookup_and_prefetch(

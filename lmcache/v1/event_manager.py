@@ -2,6 +2,8 @@
 # Standard
 from enum import Enum, auto
 import asyncio
+from concurrent.futures import Future
+from typing import Optional, Union
 import threading
 
 
@@ -25,7 +27,11 @@ class EventManager:
     def __init__(self) -> None:
         # Guard by lock
         # Structure: events[event_type][event_status][event_id] = future
-        self.events: dict[EventType, dict[EventStatus, dict[str, asyncio.Future]]] = {
+        # NOTE: we intentionally allow both asyncio.Future and concurrent.futures.Future
+        # here, because the scheduler thread may not have an asyncio loop when it
+        # needs to register an event immediately.
+        EventFuture = Union[asyncio.Future, Future]
+        self.events: dict[EventType, dict[EventStatus, dict[str, EventFuture]]] = {
             et: {es: {} for es in EventStatus} for et in EventType
         }
         self.lock = threading.Lock()
@@ -34,7 +40,7 @@ class EventManager:
         self,
         event_type: EventType,
         event_id: str,
-        future: asyncio.Future,
+        future: Union[asyncio.Future, Future],
     ) -> None:
         """
         Add an event with the given type and id.
@@ -50,7 +56,7 @@ class EventManager:
         self,
         event_type: EventType,
         event_id: str,
-    ) -> asyncio.Future:
+    ) -> Union[asyncio.Future, Future]:
         """
         Pop and return the event with the given type and id.
         """
@@ -64,6 +70,22 @@ class EventManager:
                 f"Event {event_id} of type {event_type} is not done or not found."
             )
             return done_events.pop(event_id)
+
+    def get_event_future(
+        self,
+        event_type: EventType,
+        event_id: str,
+    ) -> Optional[Union[asyncio.Future, Future]]:
+        """Return the stored future for this event_id regardless of status."""
+        with self.lock:
+            status_dict = self.events.get(event_type, None)
+            assert status_dict is not None, (
+                f"Invalid event type {event_type} in EventManager."
+            )
+            for status in EventStatus:
+                if event_id in status_dict[status]:
+                    return status_dict[status][event_id]
+            return None
 
     def update_event_status(
         self,

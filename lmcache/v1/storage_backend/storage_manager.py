@@ -614,8 +614,11 @@ class StorageManager:
         assert self.async_lookup_server is not None
         res = task.result()
         # Complete the pre-registered LOADING future and mark the event DONE.
-        if not loading_future.done():
-            loading_future.set_result(res)
+        try:
+            if not loading_future.done():
+                loading_future.set_result(res)
+        except Exception:
+            pass
         self.event_manager.update_event_status(
             EventType.LOADING, lookup_id, status=EventStatus.DONE
         )
@@ -728,12 +731,13 @@ class StorageManager:
         num_total_chunks = len(keys)
         num_total_hit_chunks = 0
 
-        # Register LOADING event immediately to avoid race conditions where
-        # CacheEngine/vLLM tries to pop the event before we reach the end of the
-        # function.
-        loop = asyncio.get_running_loop()
-        loading_future: asyncio.Future = loop.create_future()
-        self.event_manager.add_event(EventType.LOADING, lookup_id, loading_future)
+        # Reuse the LOADING event future created by the scheduler thread (best),
+        # or create one if missing (fallback).
+        loading_future = self.event_manager.get_event_future(EventType.LOADING, lookup_id)
+        if loading_future is None:
+            loop = asyncio.get_running_loop()
+            loading_future = loop.create_future()
+            self.event_manager.add_event(EventType.LOADING, lookup_id, loading_future)
 
         # Gate: If CPU DRAM pinned memory is too full, do NOT prefetch.
         # We still compute and return the true number of hit tokens (prefix hit),
@@ -815,8 +819,11 @@ class StorageManager:
         # If no chunks were hit across all backends, respond immediately and return.
         if num_total_hit_chunks == 0:
             # Mark LOADING event done with empty result so CacheEngine can pop.
-            if not loading_future.done():
-                loading_future.set_result([])
+            try:
+                if not loading_future.done():
+                    loading_future.set_result([])
+            except Exception:
+                pass
             self.event_manager.update_event_status(
                 EventType.LOADING, lookup_id, status=EventStatus.DONE
             )
@@ -828,8 +835,11 @@ class StorageManager:
         # count (prefix hit) without allocating/loading anything.
         if not do_prefetch:
             # Mark LOADING event done with empty result so CacheEngine can pop.
-            if not loading_future.done():
-                loading_future.set_result([])
+            try:
+                if not loading_future.done():
+                    loading_future.set_result([])
+            except Exception:
+                pass
             self.event_manager.update_event_status(
                 EventType.LOADING, lookup_id, status=EventStatus.DONE
             )
