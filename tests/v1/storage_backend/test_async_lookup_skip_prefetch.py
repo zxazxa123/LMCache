@@ -73,10 +73,10 @@ async def test_async_lookup_skips_prefetch_when_dram_full(storage_manager):
     # Should respond immediately with hit tokens=20 (2 chunks)
     assert storage_manager.async_lookup_server.responses == [(lookup_id, 20)]
 
-    # Should not register loading event
+    # Should register LOADING event and mark it done (even though we skipped prefetch)
     assert (
         storage_manager.event_manager.get_event_status(EventType.LOADING, lookup_id)
-        == EventStatus.NOT_FOUND
+        == EventStatus.DONE
     )
 
     assert backend.prefetch_called is False

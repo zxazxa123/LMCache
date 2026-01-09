@@ -810,6 +810,23 @@ class StorageManager:
         # If we decided to skip prefetching, immediately return the true hit-token
         # count (prefix hit) without allocating/loading anything.
         if not do_prefetch:
+            # Even when we skip prefetching, CacheEngine/vLLM expects a LOADING
+            # event to exist and be DONE so it can be popped during the normal
+            # async-loading lifecycle.
+            try:
+                loop = asyncio.get_running_loop()
+                fut: asyncio.Future = loop.create_future()
+                # Match the normal async-loading future result shape:
+                # a list of per-backend lists of MemoryObj.
+                fut.set_result([])
+                self.event_manager.add_event(EventType.LOADING, lookup_id, fut)
+                self.event_manager.update_event_status(
+                    EventType.LOADING, lookup_id, status=EventStatus.DONE
+                )
+            except Exception:
+                # Best effort: don't fail lookup because of event bookkeeping.
+                pass
+
             retrieved_length = cum_chunk_lengths_total[num_total_hit_chunks]
             logger.info(
                 "Skip prefetch for lookup_id=%s due to CPU DRAM pressure; "
